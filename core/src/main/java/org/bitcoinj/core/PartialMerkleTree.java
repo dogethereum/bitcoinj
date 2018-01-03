@@ -20,6 +20,7 @@ package org.bitcoinj.core;
 
 import java.io.IOException;
 import java.io.OutputStream;
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -212,7 +213,7 @@ public class PartialMerkleTree extends Message {
         }
     }
 
-    private static Sha256Hash combineLeftRight(byte[] left, byte[] right) {
+    static Sha256Hash combineLeftRight(byte[] left, byte[] right) {
         return Sha256Hash.wrapReversed(Sha256Hash.hashTwice(
             reverseBytes(left), 0, 32,
             reverseBytes(right), 0, 32));
@@ -258,6 +259,168 @@ public class PartialMerkleTree extends Message {
             throw new VerificationException("Got a CPartialMerkleTree that didn't need all the data it provided");
         
         return merkleRoot;
+    }
+
+    /**
+     * Returns the position of a tx within a block
+     */
+    public int getTransactionIndex(Sha256Hash txHash) {
+        if (!hashes.contains(txHash)) {
+            throw new VerificationException("Supplied tx hash is not in this tree: " + txHash);
+        }
+        // calculate height of tree
+        int height = 0;
+        while (getTreeWidth(transactionCount, height) > 1)
+            height++;
+        // traverse the partial tree
+        ValuesUsed used = new ValuesUsed();
+        GetTransactionIndexResult result = new GetTransactionIndexResult();
+        recursiveGetTransactionIndex(height, 0, used, txHash, result);
+        if (!result.found) {
+            throw new VerificationException("Could not find tx");
+        }
+        return result.counter;
+    }
+
+    private void recursiveGetTransactionIndex(int height, int pos, ValuesUsed used, Sha256Hash txHash, GetTransactionIndexResult result) throws VerificationException {
+        if (result.found) return;
+        if (used.bitsUsed >= matchedChildBits.length*8) {
+            // overflowed the bits array - failure
+            throw new VerificationException("PartialMerkleTree overflowed its bits array");
+        }
+        boolean parentOfMatch = checkBitLE(matchedChildBits, used.bitsUsed++);
+        if (height == 0 || !parentOfMatch) {
+            // if at height 0, or nothing interesting below, use stored hash and do not descend
+            if (used.hashesUsed >= hashes.size()) {
+                // overflowed the hash array - failure
+                throw new VerificationException("PartialMerkleTree overflowed its hash array");
+            }
+            Sha256Hash hash = hashes.get(used.hashesUsed++);
+            if (hash.equals(txHash))
+                // We found the tx we were looking for
+                if (parentOfMatch)
+                    // no need to increase counter
+                    result.found = true;
+                else
+                    // We found the tx hash but it is included in the tree just to be able to calculate the proof of another tx.
+                    throw new VerificationException("Could not find tx");
+            else if (height == 0)
+                // in case of height 0, we have a txid (matched or not)
+                // This is another tx that is before the tx we are looking for
+                result.counter++;
+            else
+                // !parentOfMatch is true
+                // We found an incomplete branch, calculate how many leaves the full tree has bellow this node.
+                result.counter += BigInteger.valueOf(2).pow(height).intValue();
+        } else {
+            // otherwise, descend into the subtrees to extract matched txids and hashes
+            recursiveGetTransactionIndex(height - 1, pos * 2, used, txHash, result);
+            if (pos * 2 + 1 < getTreeWidth(transactionCount, height-1)) {
+                // right tree has real content
+                recursiveGetTransactionIndex(height - 1, pos * 2 + 1, used, txHash, result);
+            }
+        }
+    }
+
+    private static class GetTransactionIndexResult {
+        public int counter = 0;
+        public boolean found = false;
+    }
+
+
+    /**
+     * Get the path of sibling nodes from the supplied tx to the root (tree root not included)
+     */
+    public List<Sha256Hash> getTransactionPath(Sha256Hash txHash) {
+        if (!hashes.contains(txHash)) {
+            throw new VerificationException("Supplied tx hash is not in this tree: " + txHash);
+        }
+        // calculate height of tree
+        int height = 0;
+        while (getTreeWidth(transactionCount, height) > 1)
+            height++;
+        ValuesUsed used = new ValuesUsed();
+        List<Sha256Hash> matchedHashes = new ArrayList<Sha256Hash>();
+        GetTransactionPathResult result = recursiveGetTransactionPath(height, 0, used, txHash, matchedHashes);
+        if (!result.found) {
+            throw new VerificationException("Could not find tx");
+        }
+        return matchedHashes;
+
+    }
+
+    /*
+     * Traverse the tree recursively and add hashes to matchedHashes as we find hashes that are part of the path.
+     * GetTransactionPathResult.found is true when the node being evaluated is txHash or txHash is bellow this node. False otherwise.
+     * GetTransactionPathResult.hash is the hash of the node being evaluated.
+     */
+    private GetTransactionPathResult recursiveGetTransactionPath(int height, int pos, ValuesUsed used, Sha256Hash txHash, List<Sha256Hash> matchedHashes) throws VerificationException {
+        GetTransactionPathResult result = new GetTransactionPathResult();
+        if (used.bitsUsed >= matchedChildBits.length*8) {
+            // overflowed the bits array - failure
+            throw new VerificationException("PartialMerkleTree overflowed its bits array");
+        }
+        boolean parentOfMatch = checkBitLE(matchedChildBits, used.bitsUsed++);
+        if (height == 0 || !parentOfMatch) {
+            // if at height 0, or nothing interesting below, use stored hash and do not descend
+            if (used.hashesUsed >= hashes.size()) {
+                // overflowed the hash array - failure
+                throw new VerificationException("PartialMerkleTree overflowed its hash array");
+            }
+            Sha256Hash hash = hashes.get(used.hashesUsed++);
+            if (hash.equals(txHash)) {
+                // We found txHash
+                if (parentOfMatch) {
+                    result.found = true;
+                    result.hash = hash;
+                    return result;
+                } else {
+                    // We found the tx hash but it is included in the tree just to be able to calculate the proof of another tx.
+                    throw new VerificationException("Could not find tx");
+                }
+            } else if (height == 0) {
+                // This is a tx, but is not txHash
+                result.hash = hash;
+                return result;
+            } else {
+                // !parentOfMatch is true
+                // We found an incomplete branch
+                result.hash = hash;
+                return result;
+            }
+        } else {
+            // otherwise, descend into the subtrees to extract matched txids and hashes
+            GetTransactionPathResult left = recursiveGetTransactionPath(height - 1, pos * 2, used, txHash, matchedHashes);
+            GetTransactionPathResult right;
+            if (pos * 2 + 1 < getTreeWidth(transactionCount, height-1)) {
+                // right tree has real content
+                right = recursiveGetTransactionPath(height - 1, pos * 2 + 1, used, txHash, matchedHashes);
+            } else {
+                right = new GetTransactionPathResult();
+                // don't copy left.found
+                right.hash = left.hash;
+            }
+            Sha256Hash thisNode = combineLeftRight(left.hash.getBytes(), right.hash.getBytes());
+            result.hash = thisNode;
+            if (left.found || right.found) {
+                // txHash is bellow this node, add to matchedHashes the "opposite" hash.
+                result.found = true;
+                if (left.found) {
+                    matchedHashes.add(right.hash);
+                } else {
+                    matchedHashes.add(left.hash);
+                }
+                return result;
+            } else {
+                // txHash is not bellow this node, nothing to add to matchedHashes.
+                return result;
+            }
+        }
+    }
+
+    private static class GetTransactionPathResult {
+        public Sha256Hash hash;
+        public boolean found = false;
     }
 
     public int getTransactionCount() {
